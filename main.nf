@@ -27,19 +27,19 @@ def helpMessage() {
 
     The typical command for running the pipeline is as follows:
 
-    nextflow run nf-core/outlaw --reads '*_R{1,2}.fastq.gz' -profile docker
+    nextflow run nf-core/outlaw --reads '*_{I1,R1,R2}.fastq.gz' -profile docker
 
     Mandatory arguments:
-      --reads                       Path to input data (must be surrounded with quotes)
-      --genome                      Name of iGenomes reference
+      --reads                       Only accepts the new style of 10X fastq format (R1, R2 and I1 files)
+      --fasta                       Path 10X formatted reference folder
       -profile                      Configuration profile to use. Can use multiple (comma separated)
                                     Available: conda, docker, singularity, awsbatch, test and more.
-
     Options:
-      --singleEnd                   Specifies that the input is single end reads
+      --nopreflight                 Skip input validation in Longranger. Useful if you know your data is irregular.
+      --id                          Overrides id generated from fastq name. If multiple samples this will be a prefix to those names
 
     References                      If not specified in the configuration file or you wish to overwrite any of the references.
-      --fasta                       Path to Fasta reference
+      --genome                      Name of iGenomes reference
 
     Other options:
       --outdir                      The output directory where the results will be saved
@@ -101,26 +101,16 @@ ch_output_docs = Channel.fromPath("$baseDir/docs/output.md")
 /*
  * Create a channel for input read files
  */
- if(params.readPaths){
-     if(params.singleEnd){
-         Channel
-             .from(params.readPaths)
-             .map { row -> [ row[0], [file(row[1][0])]] }
-             .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-             .into { read_files_fastqc; read_files_trimming }
-     } else {
-         Channel
-             .from(params.readPaths)
-             .map { row -> [ row[0], [file(row[1][0]), file(row[1][1])]] }
-             .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-             .into { read_files_fastqc; read_files_trimming }
-     }
- } else {
-     Channel
-         .fromFilePairs( params.reads, size: params.singleEnd ? 1 : 2 )
-         .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
-         .into { read_files_fastqc; read_files_trimming }
- }
+
+
+Channel
+   .fromFilePairs( params.reads, size: 3 )
+   .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
+   .into { read_files_fastqc; read_files_longranger }
+
+
+
+
 
 
 // Header log info
@@ -198,35 +188,30 @@ process get_software_versions {
     """
     echo $workflow.manifest.version > v_pipeline.txt
     echo $workflow.nextflow.version > v_nextflow.txt
-    fastqc --version > v_fastqc.txt
     multiqc --version > v_multiqc.txt
     scrape_software_versions.py > software_versions_mqc.yaml
     """
 }
 
 
-
-/*
- * STEP 1 - FastQC
- */
-process fastqc {
+process longranger {
     tag "$name"
-    publishDir "${params.outdir}/fastqc", mode: 'copy',
-        saveAs: {filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"}
+    publishDir "${params.outdir}/longranger", mode: 'copy'
 
     input:
-    set val(name), file(reads) from read_files_fastqc
+    set val(name), file(reads) from read_files_longranger
 
     output:
-    file "*_fastqc.{zip,html}" into fastqc_results
+    file "$name" into longranger_results
 
+    // TODO: needs to support dynamic fastq file names
     script:
     """
-    fastqc -q $reads
+    mkdir fastqs; mv *.fastq.gz fastqs/
+    longranger wgs --id=$name --fastqs=fastqs/ --reference=$params.fasta --vcmode=freebayes --localmem=2
+
     """
 }
-
-
 
 /*
  * STEP 2 - MultiQC
@@ -237,7 +222,8 @@ process multiqc {
     input:
     file multiqc_config from ch_multiqc_config
     // TODO nf-core: Add in log files from your new processes for MultiQC to find!
-    file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
+    //file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
+    file ('longranger/*') from longranger_results.collect().ifEmpty([])
     file ('software_versions/*') from software_versions_yaml
     file workflow_summary from create_workflow_summary(summary)
 
